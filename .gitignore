@@ -1,0 +1,20 @@
+# KB tooling is a disposable local copy of a separate, proprietary kit — never publish it.
+# The vault under _knowledge/ is the tracked artifact; the scripts that maintain it are not.
+_meta/
+
+# Local PII denylist consumed by the pre-push guard — must never be committed.
+.pii-denylist.local
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor
+.idea/
+.vscode/
+*.swp

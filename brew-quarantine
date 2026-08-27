@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""
+brew-quarantine — enforce a minimum age ("cooldown") on Homebrew installs and upgrades.
+
+This is a supply-chain gate, NOT macOS Gatekeeper quarantine (`brew install --quarantine`).
+It refuses to install or upgrade to any formula/cask revision whose definition landed in its
+tap less than N days ago (default 7), on the theory that malicious or broken releases are
+usually caught and yanked within that window.
+
+Because it is installed as `brew-quarantine` on PATH, Homebrew also exposes it as:
+
+    brew quarantine upgrade
+    brew quarantine install <pkg>
+    brew quarantine status
+
+Age signal: the last commit date of the package's own .rb file in its tap.
+  - homebrew/core and homebrew/cask are not local git clones (Homebrew 4+ uses the JSON API),
+    so their dates come from the GitHub API.
+  - Third-party taps are local clones, so their dates come from `git log`.
+The bottle's OCI `org.opencontainers.image.created` annotation is deliberately NOT used: it
+does not move when a bottle is rebuilt, so a freshly rebuilt bottle can read as years old.
+
+Dependency closure matters. `brew upgrade ffmpeg` also upgrades mpv and three dependencies,
+so gating only the packages you named is decorative. This tool asks Homebrew for the full
+would-touch set via `--dry-run`, ages every member, then drops violators *and everything that
+depends on them*, repeating until the plan is clean.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFAULT_DAYS = int(os.environ.get("BREW_QUARANTINE_DAYS", "7"))
+CACHE_PATH = Path(
+    os.environ.get("BREW_QUARANTINE_CACHE", Path.home() / ".cache/brew-quarantine/dates.json")
+)
+GITHUB_TAP_REPOS = {
+    "homebrew/core": "Homebrew/homebrew-core",
+    "homebrew/cask": "Homebrew/homebrew-cask",
+}
+MAX_ITERATIONS = 25
+
+IS_TTY = sys.stdout.isatty()
+
+
+def c(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if IS_TTY else text
+
+
+BOLD = lambda s: c(s, "1")
+DIM = lambda s: c(s, "2")
+RED = lambda s: c(s, "31")
+GREEN = lambda s: c(s, "32")
+YELLOW = lambda s: c(s, "33")
+BLUE = lambda s: c(s, "34")
+
+
+# --------------------------------------------------------------------------------------
+# shelling out to brew
+# --------------------------------------------------------------------------------------
+
+def brew_env() -> dict:
+    """Homebrew env for every child call.
+
+    HOMEBREW_NO_AUTO_UPDATE is pinned so the metadata we age is the metadata we install
+    from; an implicit auto-update between the dry-run and the real run would let an
+    unaged version slip through.
+    """
+    env = dict(os.environ)
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["HOMEBREW_NO_COLOR"] = "1"
+    env["HOMEBREW_NO_EMOJI"] = "1"
+    return env
+
+
+def brew(*args: str, check: bool = False, timeout: int = 900) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["brew", *args],
+        capture_output=True,
+        text=True,
+        env=brew_env(),
+        check=check,
+        timeout=timeout,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# plan resolution — what would brew ACTUALLY touch?
+# --------------------------------------------------------------------------------------
+
+SECTION_RE = re.compile(r"^==>\s+Would\s+(install|upgrade)\b", re.IGNORECASE)
+# A Homebrew package name, optionally tap-qualified (user/tap/name).
+PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@+._-]*(?:/[A-Za-z0-9][A-Za-z0-9@+._-]*){0,2}$")
+# A bare version string: "0.14.5", "20260817.0", "0.9.15_1", "2.36.32".
+# Deliberately does NOT match names that merely start with a digit ("7zip"), because those
+# need a separator before any letters.
+VERSION_RE = re.compile(r"^\d[\d.]*(?:[._+-][A-Za-z0-9.]+)*$")
+
+
+_OUTDATED_CACHE: set[str] | None = None
+
+
+def outdated_set() -> set[str]:
+    """Currently-outdated package names, cached for the life of the process."""
+    global _OUTDATED_CACHE
+    if _OUTDATED_CACHE is None:
+        _OUTDATED_CACHE = set(outdated_packages())
+    return _OUTDATED_CACHE
+
+
+def expand_with_outdated_deps(plan: set[str]) -> set[str]:
+    """Add the outdated recursive dependencies of everything in the plan.
+
+    `brew <action> --dry-run` under-reports. It enumerates the dependencies of packages you
+    *named*, but not of packages that enter the plan only as dependents. Observed live:
+    upgrading a set that did not include mpv still pulled mpv in as a dependent, and mpv
+    then dragged its own outdated deps -- glib, ffmpeg, x265, simdjson -- past the gate,
+    none of which appeared anywhere in the dry-run output.
+
+    Since `brew upgrade X` always upgrades X's outdated dependencies, any outdated package
+    in the plan's dependency closure will be installed and therefore must be aged.
+    """
+    if not plan:
+        return plan
+    outdated = outdated_set()
+    if not outdated:
+        return plan
+    meta = load_metadata(sorted(plan))
+    formulae = [n for n in sorted(plan) if meta.get(n) and meta[n].kind == "formula"]
+    casks = [n for n in sorted(plan) if meta.get(n) and meta[n].kind == "cask"]
+    deps: set[str] = set()
+    for flag, group in (("--formula", formulae), ("--cask", casks)):
+        if not group:
+            continue
+        proc = brew("deps", "--union", flag, *group)
+        if proc.returncode == 0:
+            deps |= {t for t in proc.stdout.split() if t}
+    return set(plan) | (deps & outdated)
+
+
+def resolve_plan(action: str, packages: list[str], extra_args: list[str]) -> tuple[set[str], str]:
+    """Return (package names brew would install/upgrade, raw dry-run output).
+
+    Parses the `==> Would install/upgrade ...` sections, which cover both the named
+    packages and the dependencies pulled in behind them.
+
+    Only stdout is parsed. Homebrew writes the plan to stdout but sends warnings (notably
+    the Homebrew 6 tap-trust notice, which is many lines of unindented prose) to stderr;
+    merging the two lets prose words like "the" and "taps" be read as package names.
+    PKG_RE is a second line of defence: a section ends at the first line that does not
+    consist solely of package-shaped tokens.
+    """
+    if not packages and action == "install":
+        return set(), ""
+    proc = brew(action, "--dry-run", *extra_args, *packages)
+    out = proc.stdout
+
+    names: set[str] = set()
+    in_section = False
+    for line in out.splitlines():
+        if line.startswith("==>"):
+            in_section = bool(SECTION_RE.match(line))
+            continue
+        if not in_section:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            in_section = False
+            continue
+        if "->" in stripped:
+            # "mpg123  1.33.6 -> 1.33.7" / "ffmpeg  8.1.2_1 -> 9.0.1_1 (21.5MB)"
+            head = stripped.split()[0]
+            if PKG_RE.match(head):
+                names.add(head)
+            else:
+                in_section = False
+            continue
+        # Either a lone name ("tealdeer"), several names on one line, or the two-column
+        # "name  version" layout used by "Would install N dependencies for X:":
+        #     aws-c-common        0.14.5
+        # A lone token is always a name; on multi-token lines, version-shaped tokens are
+        # dropped so "0.14.5" is not mistaken for a package.
+        toks = stripped.split()
+        if not toks:
+            in_section = False
+            continue
+        if len(toks) == 1:
+            if PKG_RE.match(toks[0]):
+                names.add(toks[0])
+            else:
+                in_section = False
+            continue
+        keep = [t for t in toks if PKG_RE.match(t) and not VERSION_RE.match(t)]
+        if keep:
+            names.update(keep)
+        else:
+            in_section = False
+    return expand_with_outdated_deps(names), out
+
+
+# --------------------------------------------------------------------------------------
+# package metadata
+# --------------------------------------------------------------------------------------
+
+class Pkg:
+    __slots__ = ("name", "kind", "tap", "path", "version", "unenforceable", "why_unenforceable")
+
+    def __init__(self, name, kind, tap, path, version, unenforceable=False, why=""):
+        self.name = name
+        self.kind = kind
+        self.tap = tap
+        self.path = path
+        self.version = version
+        self.unenforceable = unenforceable
+        self.why_unenforceable = why
+
+    @property
+    def cache_key(self) -> str:
+        return f"{self.tap}|{self.path}|{self.version}"
+
+
+def load_metadata(names: list[str]) -> dict[str, Pkg]:
+    """Batch `brew info --json=v2`, falling back to one-at-a-time if the batch errors."""
+    if not names:
+        return {}
+    result: dict[str, Pkg] = {}
+
+    def ingest(payload: dict) -> None:
+        for f in payload.get("formulae", []):
+            result[f["name"]] = Pkg(
+                name=f["name"],
+                kind="formula",
+                tap=f.get("tap") or "",
+                path=f.get("ruby_source_path") or "",
+                version=(f.get("versions") or {}).get("stable") or "",
+            )
+        for k in payload.get("casks", []):
+            token = k.get("token") or ""
+            version = k.get("version") or ""
+            sha = k.get("sha256")
+            reasons = []
+            if version == "latest":
+                reasons.append("version :latest")
+            if sha == "no_check":
+                reasons.append("sha256 :no_check")
+            if k.get("auto_updates"):
+                reasons.append("app self-updates")
+            result[token] = Pkg(
+                name=token,
+                kind="cask",
+                tap=k.get("tap") or "",
+                path=k.get("ruby_source_path") or "",
+                version=version,
+                unenforceable=bool(reasons),
+                why=", ".join(reasons),
+            )
+
+    proc = brew("info", "--json=v2", *names)
+    if proc.returncode == 0 and proc.stdout.strip():
+        try:
+            ingest(json.loads(proc.stdout))
+        except json.JSONDecodeError:
+            pass
+
+    missing = [n for n in names if n.split("/")[-1] not in result and n not in result]
+    for n in missing:
+        p = brew("info", "--json=v2", n)
+        if p.returncode == 0 and p.stdout.strip():
+            try:
+                ingest(json.loads(p.stdout))
+            except json.JSONDecodeError:
+                pass
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# age lookup
+# --------------------------------------------------------------------------------------
+
+class DateCache:
+    """Caches the *date* a revision landed, never the pass/fail verdict.
+
+    Caching a verdict would let a 'blocked' decision outlive its own cooldown window.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict[str, str] = {}
+        try:
+            self.data = json.loads(path.read_text())
+        except Exception:
+            self.data = {}
+        self.dirty = False
+
+    def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    def put(self, key: str, iso: str) -> None:
+        if self.data.get(key) != iso:
+            self.data[key] = iso
+            self.dirty = True
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, indent=0, sort_keys=True))
+        except OSError:
+            pass
+
+
+def github_token() -> str | None:
+    if os.environ.get("HOMEBREW_GITHUB_API_TOKEN"):
+        return os.environ["HOMEBREW_GITHUB_API_TOKEN"]
+    if os.environ.get("GITHUB_TOKEN"):
+        return os.environ["GITHUB_TOKEN"]
+    try:
+        p = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def github_file_date(repo: str, path: str, token: str | None) -> str | None:
+    url = (
+        f"https://api.github.com/repos/{repo}/commits"
+        f"?path={urllib.parse.quote(path)}&per_page=1"
+    )
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "brew-quarantine",
+        **({"Authorization": f"Bearer {token}"} if token else {}),
+    })
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read())
+            if isinstance(data, list) and data:
+                return data[0]["commit"]["committer"]["date"]
+            return None
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            return None
+    return None
+
+
+def local_tap_date(tap: str, path: str) -> str | None:
+    repo = brew("--repo", tap)
+    if repo.returncode != 0:
+        return None
+    repo_path = repo.stdout.strip()
+    if not repo_path or not Path(repo_path, ".git").exists():
+        return None
+    p = subprocess.run(
+        ["git", "-C", repo_path, "log", "-1", "--format=%cI", "--", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    return p.stdout.strip() or None
+
+
+def lookup_dates(pkgs: list[Pkg], cache: DateCache, workers: int = 8) -> dict[str, str | None]:
+    """name -> ISO8601 date the package's .rb last changed (None = unknown)."""
+    gh_auth = None
+    out: dict[str, str | None] = {}
+    todo: list[Pkg] = []
+
+    for p in pkgs:
+        if not p.path or not p.tap:
+            out[p.name] = None
+            continue
+        cached = cache.get(p.cache_key)
+        if cached:
+            out[p.name] = cached
+        else:
+            todo.append(p)
+
+    if any(p.tap in GITHUB_TAP_REPOS for p in todo):
+        gh_auth = github_token()
+
+    def one(p: Pkg) -> tuple[str, str | None]:
+        if p.tap in GITHUB_TAP_REPOS:
+            return p.name, github_file_date(GITHUB_TAP_REPOS[p.tap], p.path, gh_auth)
+        return p.name, local_tap_date(p.tap, p.path)
+
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for name, iso in pool.map(one, todo):
+                out[name] = iso
+        for p in todo:
+            if out.get(p.name):
+                cache.put(p.cache_key, out[p.name])
+        cache.save()
+    return out
+
+
+def age_days(iso: str, now: datetime) -> float:
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return (now - dt).total_seconds() / 86400.0
+
+
+# --------------------------------------------------------------------------------------
+# reverse dependency map
+# --------------------------------------------------------------------------------------
+
+def dependents_within(candidates: set[str], violators: set[str], meta: dict[str, Pkg]) -> set[str]:
+    """Candidates whose recursive dependency closure contains a violator.
+
+    Upgrading them would drag the violator in anyway, so they have to be held too.
+
+    Formulae and casks are queried separately: `brew deps --for-each --formula` errors out
+    if a cask token is in the list, which previously made this return nothing and stalled
+    the fixed point.
+    """
+    if not candidates or not violators:
+        return set()
+
+    formulae = sorted(n for n in candidates if meta.get(n) and meta[n].kind == "formula")
+    casks = sorted(n for n in candidates if meta.get(n) and meta[n].kind == "cask")
+    unknown = sorted(n for n in candidates if n not in meta)
+    hit: set[str] = set()
+
+    for flag, group in (("--formula", formulae), ("--cask", casks), (None, unknown)):
+        if not group:
+            continue
+        args = ["deps", "--for-each"] + ([flag] if flag else []) + list(group)
+        proc = brew(*args)
+        if proc.returncode != 0:
+            continue
+        for line in proc.stdout.splitlines():
+            if ":" not in line:
+                continue
+            name, _, deps = line.partition(":")
+            name = name.strip()
+            if name in candidates and violators & set(deps.split()):
+                hit.add(name)
+
+    return hit
+
+
+def isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknown):
+    """Fallback when the fixed point stalls: keep only candidates that are clean alone.
+
+    Costs one dry-run per candidate, so it is used only off the stall path. A candidate is
+    kept when its own resolved plan contains nothing younger than the cooldown, which makes
+    the union of the kept plans clean too.
+    """
+    keep: list[str] = []
+    for cand in sorted(candidates):
+        plan, _ = resolve_plan(action, [cand], extra_args)
+        if not plan:
+            continue
+        meta = load_metadata(sorted(plan))
+        pkgs = [meta[n] for n in sorted(plan) if n in meta]
+        if len(pkgs) != len(plan) and not allow_unknown:
+            continue
+        dates = lookup_dates(pkgs, cache)
+        ok = True
+        for p in pkgs:
+            iso = dates.get(p.name)
+            if iso is None:
+                if not allow_unknown:
+                    ok = False
+                    break
+                continue
+            if age_days(iso, now) < days:
+                ok = False
+                break
+        if ok:
+            keep.append(cand)
+    return set(keep)
+
+
+# --------------------------------------------------------------------------------------
+# the gate
+# --------------------------------------------------------------------------------------
+
+class Held:
+    def __init__(self, pkg: Pkg, date: str | None, days: float | None, reason: str):
+        self.pkg = pkg
+        self.date = date
+        self.days = days
+        self.reason = reason
+
+    def clears_on(self, threshold: int) -> str:
+        if not self.date:
+            return "unknown"
+        dt = datetime.fromisoformat(self.date.replace("Z", "+00:00"))
+        return (dt + timedelta(days=threshold)).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def evaluate(
+    action: str,
+    requested: list[str],
+    days: int,
+    extra_args: list[str],
+    cache: DateCache,
+    verbose: bool,
+    allow_unknown: bool,
+):
+    """Fixed-point: shrink the candidate set until the whole plan is old enough."""
+    now = datetime.now(timezone.utc)
+    held: dict[str, Held] = {}
+    unenforceable: list[Pkg] = []
+    plan: set[str] = set()
+
+    # Packages Homebrew itself cannot resolve (most often: a tap that is untrusted under
+    # Homebrew 6 tap trust) can never be dropped by the fixed point, because nothing in the
+    # candidate set depends on them. Set them aside up front and report them separately;
+    # brew would not act on them anyway.
+    req_meta = load_metadata(sorted(set(requested)))
+    skipped = sorted(n for n in set(requested) if n not in req_meta)
+    candidates = {n for n in requested if n in req_meta}
+
+    def age_check(plan_names, record):
+        """Return (violators, pkgs, meta) for a resolved plan."""
+        meta = load_metadata(sorted(plan_names))
+        pkgs = [meta[n] for n in sorted(plan_names) if n in meta]
+        dates = lookup_dates(pkgs, cache)
+        bad: set[str] = set()
+        for p in pkgs:
+            iso = dates.get(p.name)
+            if iso is None:
+                if not allow_unknown:
+                    bad.add(p.name)
+                    if record:
+                        held[p.name] = Held(p, None, None, "age unknown")
+                continue
+            a = age_days(iso, now)
+            if a < days:
+                bad.add(p.name)
+                if record:
+                    held[p.name] = Held(p, iso, a, "too new")
+        for n in sorted(set(plan_names) - set(meta)):
+            if not allow_unknown:
+                bad.add(n)
+                if record:
+                    held[n] = Held(Pkg(n, "?", "", "", ""), None, None, "metadata unavailable")
+        return bad, pkgs, meta
+
+    for iteration in range(MAX_ITERATIONS):
+        if not candidates:
+            plan = set()
+            break
+
+        plan, _raw = resolve_plan(action, sorted(candidates), extra_args)
+        if not plan:
+            break
+
+        if verbose:
+            print(DIM(f"  [pass {iteration + 1}] plan={len(plan)} candidates={len(candidates)}"), file=sys.stderr)
+
+        violators, pkgs, meta = age_check(plan, record=True)
+
+        if not violators:
+            unenforceable = [p for p in pkgs if p.unenforceable]
+            break
+
+        # A violator that is a pure dependency is not itself in `candidates`; the only way
+        # to avoid it is to hold whichever candidates pull it in.
+        drop = (violators & candidates) | dependents_within(candidates, violators, meta)
+        new_candidates = candidates - drop
+        if new_candidates == candidates:
+            if verbose:
+                print(DIM("  [stall] falling back to per-candidate isolation"), file=sys.stderr)
+            candidates = isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknown)
+            plan, _ = resolve_plan(action, sorted(candidates), extra_args) if candidates else (set(), "")
+            _v, pkgs, _m = age_check(plan, record=False) if plan else (set(), [], {})
+            unenforceable = [p for p in pkgs if p.unenforceable]
+            break
+        candidates = new_candidates
+    else:
+        print(YELLOW(f"Warning: gate did not converge in {MAX_ITERATIONS} passes; holding all."), file=sys.stderr)
+        candidates, plan = set(), set()
+
+    # Final verification: whatever we are about to hand to brew must itself resolve to a
+    # plan with nothing younger than the cooldown. This is the check that catches a
+    # dependency leak; a unit test of the date lookup would not.
+    leaked: set[str] = set()
+    if candidates:
+        final_plan, _ = resolve_plan(action, sorted(candidates), extra_args)
+        leaked, _p, _m = age_check(final_plan, record=False)
+        plan = final_plan
+        if leaked:
+            candidates, plan = set(), set()
+
+    # Anything requested that is neither cleared, nor directly held, nor skipped was dropped
+    # because it depends on something inside the cooldown. Report it explicitly with the
+    # dependency responsible — otherwise those packages vanish from the report and the run
+    # looks like it covered more than it did.
+    # Measured against the final plan, not the candidate set: Homebrew pulls dependents of
+    # a candidate into the plan too (upgrading ffmpeg also upgrades mpv), so a package can
+    # be upgraded without ever having been a candidate. Using `candidates` here listed six
+    # packages as held that were in fact being upgraded.
+    blocked = set(held)
+    pending = sorted((set(requested) & set(req_meta)) - set(plan) - blocked)
+    implicit: dict[str, list[str]] = {}
+    if pending:
+        depmap: dict[str, list[str]] = {}
+        groups = (
+            ("--formula", [n for n in pending if req_meta[n].kind == "formula"]),
+            ("--cask", [n for n in pending if req_meta[n].kind == "cask"]),
+        )
+        for flag, group in groups:
+            if not group:
+                continue
+            p = brew("deps", "--for-each", flag, *group)
+            if p.returncode != 0:
+                continue
+            for line in p.stdout.splitlines():
+                if ":" not in line:
+                    continue
+                nm, _, ds = line.partition(":")
+                depmap[nm.strip()] = ds.split()
+        for n in pending:
+            implicit[n] = sorted(set(depmap.get(n, [])) & blocked)
+
+    return sorted(candidates), sorted(plan), held, unenforceable, skipped, sorted(leaked), implicit
+
+
+# --------------------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------------------
+
+def print_report(days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit):
+    print()
+    print(BOLD(f"Homebrew quarantine — {days}-day cooldown ({action})"))
+    print(DIM("  age = last commit to the package's .rb file in its tap"))
+    print()
+
+    if held:
+        print(RED(f"HELD ({len(held)})") + DIM("  — too new, or age could not be established"))
+        width = max(len(h.pkg.name) for h in held.values())
+        for name in sorted(held):
+            h = held[name]
+            age = f"{h.days:5.1f}d" if h.days is not None else "  ? "
+            kind = h.pkg.kind if h.pkg.kind != "?" else "?"
+            print(f"  {name.ljust(width)}  {age}  {DIM(kind.ljust(7))}  {h.reason:<22} clears {h.clears_on(days)}")
+        print()
+
+    if implicit:
+        print(YELLOW(f"HELD TRANSITIVELY ({len(implicit)})") + DIM("  — themselves old enough, but depend on something inside the cooldown"))
+        width = max(len(n) for n in implicit)
+        for n in sorted(implicit):
+            why = ", ".join(implicit[n]) if implicit[n] else "a held dependency"
+            print(f"  {n.ljust(width)}  {DIM('blocked by: ' + why)}")
+        print()
+
+    if skipped:
+        print(BLUE(f"SKIPPED ({len(skipped)})") + DIM("  — Homebrew cannot resolve these; not upgraded either way"))
+        for n in skipped:
+            print(f"  {n}  {DIM('(tap not trusted, or package unavailable)')}")
+        print(DIM("  Homebrew 6 tap trust is ignoring these taps; see `brew trust --help`."))
+        print()
+
+    if leaked:
+        print(RED("VERIFICATION FAILED") + DIM("  — final plan still contained packages inside the cooldown:"))
+        for n in leaked:
+            print(f"  {n}")
+        print(RED("  Refusing to run brew. This is a bug in the gate; report it."))
+        print()
+
+    if unenforceable:
+        print(YELLOW(f"CANNOT FULLY ENFORCE ({len(unenforceable)})") + DIM("  — cask file is old enough, but the payload isn't pinned"))
+        for p in sorted(unenforceable, key=lambda x: x.name):
+            print(f"  {p.name}  {DIM('(' + p.why_unenforceable + ')')}")
+        print(DIM("  These fetch whatever the vendor serves now, regardless of the cask file's age."))
+        print()
+
+    if plan:
+        print(GREEN(f"CLEARED ({len(plan)})") + DIM("  — will be installed/upgraded"))
+        line, out = "  ", []
+        for n in plan:
+            if len(line) + len(n) + 2 > 96:
+                out.append(line); line = "  "
+            line += n + "  "
+        out.append(line)
+        print("\n".join(out))
+        print()
+    else:
+        print(DIM("Nothing cleared the cooldown window."))
+        print()
+
+
+# --------------------------------------------------------------------------------------
+# subcommands
+# --------------------------------------------------------------------------------------
+
+def outdated_packages() -> list[str]:
+    proc = brew("outdated", "--json=v2")
+    if proc.returncode != 0:
+        return []
+    try:
+        d = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    names = [f["name"] for f in d.get("formulae", []) if not f.get("pinned")]
+    names += [k["name"] for k in d.get("casks", []) if not k.get("pinned")]
+    return names
+
+
+def cmd_gate(args, action: str) -> int:
+    cache = DateCache(CACHE_PATH)
+
+    if args.bypass:
+        print(YELLOW("Cooldown bypassed (--bypass). Running brew directly."), file=sys.stderr)
+        return subprocess.run(["brew", action, *args.brew_args, *args.packages]).returncode
+
+    # Progress chatter goes to stderr so that --json emits parseable stdout.
+    if not args.no_update:
+        print(DIM("==> brew update"), file=sys.stderr)
+        subprocess.run(["brew", "update", "--quiet"], env=brew_env())
+
+    requested = args.packages or (outdated_packages() if action == "upgrade" else [])
+    if not requested:
+        print(GREEN("Nothing to do — no outdated packages." if action == "upgrade" else "No packages given."))
+        return 0
+
+    print(DIM(f"==> resolving plan and ages for {len(requested)} package(s)…"), file=sys.stderr)
+    survivors, plan, held, unenforceable, skipped, leaked, implicit = evaluate(
+        action, requested, args.days, args.brew_args, cache, args.verbose, args.allow_unknown
+    )
+
+    if args.json:
+        print(json.dumps({
+            "action": action,
+            "days": args.days,
+            "cleared": plan,
+            "held": {
+                n: {"age_days": h.days, "date": h.date, "reason": h.reason,
+                    "clears_on": h.clears_on(args.days), "kind": h.pkg.kind}
+                for n, h in held.items()
+            },
+            "cannot_enforce": [{"name": p.name, "why": p.why_unenforceable} for p in unenforceable],
+            "skipped": skipped,
+            "verification_failed": leaked,
+            "held_transitively": implicit,
+        }, indent=2))
+        return 2 if leaked else 0
+
+    print_report(args.days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit)
+
+    if leaked:
+        return 2
+    if not survivors:
+        return 0
+    if args.dry_run:
+        print(DIM("--dry-run: stopping before execution."))
+        return 0
+
+    print(BOLD(f"==> brew {action} {' '.join(survivors)}"))
+    return subprocess.run(
+        ["brew", action, *args.brew_args, *survivors], env=brew_env()
+    ).returncode
+
+
+def cmd_status(args) -> int:
+    cache = DateCache(CACHE_PATH)
+    requested = args.packages or outdated_packages()
+    if not requested:
+        print(GREEN("No outdated packages."))
+        return 0
+    now = datetime.now(timezone.utc)
+    meta = load_metadata(requested)
+    pkgs = [meta[n] for n in requested if n in meta]
+    dates = lookup_dates(pkgs, cache)
+
+    rows = []
+    for p in pkgs:
+        iso = dates.get(p.name)
+        a = age_days(iso, now) if iso else None
+        rows.append((p, iso, a))
+    rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 0))
+
+    width = max(len(p.name) for p, _, _ in rows)
+    print()
+    print(BOLD(f"Outdated packages by age of their tap definition (cooldown = {args.days}d)"))
+    print()
+    for p, iso, a in rows:
+        if a is None:
+            mark, age = YELLOW("  ?  "), "unknown"
+        elif a < args.days:
+            mark, age = RED(" HELD"), f"{a:.1f}d"
+        else:
+            mark, age = GREEN(" OK  "), f"{a:.1f}d"
+        extra = DIM(f"  ({p.why_unenforceable})") if p.unenforceable else ""
+        print(f" {mark}  {p.name.ljust(width)}  {age:>8}  {DIM(p.tap)}{extra}")
+    print()
+    return 0
+
+
+def main() -> int:
+    def add_global_flags(p, suppress: bool) -> None:
+        """Global flags, added to both the main parser and every subparser.
+
+        The subparser copies use default=SUPPRESS so that a flag given *before* the
+        subcommand is not silently overwritten by the subparser's own default. That lets
+        both `brew-quarantine --dry-run upgrade` and the more natural `brew upgrade
+        --dry-run` work identically.
+        """
+        def kw(default):
+            return {"default": argparse.SUPPRESS} if suppress else {"default": default}
+
+        p.add_argument("--days", type=int, **kw(DEFAULT_DAYS),
+                       help=f"cooldown window in days (default {DEFAULT_DAYS}, env BREW_QUARANTINE_DAYS)")
+        # Named --bypass, not --no-quarantine, to avoid confusion with Homebrew's own
+        # (now-deprecated) --no-quarantine, which is about macOS Gatekeeper, not cooldowns.
+        p.add_argument("--bypass", action="store_true", **kw(False),
+                       help="skip the gate and run brew directly")
+        p.add_argument("--dry-run", action="store_true", **kw(False),
+                       help="report only; do not run brew")
+        p.add_argument("--no-update", action="store_true", **kw(False),
+                       help="skip the initial `brew update`")
+        p.add_argument("--allow-unknown", action="store_true", **kw(False),
+                       help="let packages whose age cannot be determined through (default: hold them)")
+        p.add_argument("--json", action="store_true", **kw(False),
+                       help="machine-readable output")
+        p.add_argument("-v", "--verbose", action="store_true", **kw(False))
+
+    ap = argparse.ArgumentParser(
+        prog="brew-quarantine",
+        description="Enforce a minimum age (cooldown) on Homebrew installs and upgrades. "
+                    "This is a supply-chain delay, not macOS Gatekeeper quarantine.",
+    )
+    add_global_flags(ap, suppress=False)
+
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, help_text in (
+        ("upgrade", "upgrade only packages that have cleared the cooldown"),
+        ("install", "install only if the package and its deps have cleared the cooldown"),
+        ("status", "show outdated packages and how long until each clears"),
+    ):
+        s = sub.add_parser(name, help=help_text)
+        s.add_argument("packages", nargs="*")
+        s.add_argument("--brew-arg", dest="brew_args", action="append", default=[],
+                       help="extra argument passed through to brew (repeatable)")
+        add_global_flags(s, suppress=True)
+
+    args = ap.parse_args()
+    if args.cmd == "status":
+        return cmd_status(args)
+    return cmd_gate(args, args.cmd)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
