@@ -1,0 +1,8 @@
+#!/bin/sh
+# Block a push if PII / private-context patterns appear in tracked files.
+# pii-scan.py lives in _meta/ (gitignored); skip cleanly if it is absent.
+[ -f _meta/pii-scan.py ] || exit 0
+python3 _meta/pii-scan.py || {
+  echo "pre-push: PII scan failed — push blocked. Override: git push --no-verify" >&2
+  exit 1
+}
