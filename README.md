@@ -171,9 +171,12 @@ Only the *date* a revision landed is cached, keyed by `(tap, path, version)` —
 ## Repository layout
 
 ```
-brew-quarantine        the tool — a single dependency-free Python file
-_knowledge/            project knowledge vault (design decisions, gotchas, open work)
+brew-quarantine          the tool — a single dependency-free Python file
+test_brew_quarantine.py  self-tests — stdlib only, never runs brew
+_knowledge/              project knowledge vault (design decisions, gotchas, open work)
 ```
+
+Run the self-tests with `python3 -m unittest -v test_brew_quarantine`. Every Homebrew and network call is replaced by a fake, so they are safe on a machine you care about.
 
 The `_knowledge/` vault holds the durable reasoning behind the implementation: why the age signal is what it is, which parsing traps bit during development, and what is still open. Start at [`_knowledge/INDEX.md`](_knowledge/INDEX.md).
 

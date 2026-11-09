@@ -465,11 +465,16 @@ def isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknow
     Costs one dry-run per candidate, so it is used only off the stall path. A candidate is
     kept when its own resolved plan contains nothing younger than the cooldown, which makes
     the union of the kept plans clean too.
+
+    Returns (kept, noop). A candidate whose own plan is empty is a no-op for brew; it is
+    returned separately so the report does not label it as blocked by a held dependency.
     """
     keep: list[str] = []
+    noop: set[str] = set()
     for cand in sorted(candidates):
         plan, _ = resolve_plan(action, [cand], extra_args)
         if not plan:
+            noop.add(cand)
             continue
         meta = load_metadata(sorted(plan))
         pkgs = [meta[n] for n in sorted(plan) if n in meta]
@@ -489,7 +494,7 @@ def isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknow
                 break
         if ok:
             keep.append(cand)
-    return set(keep)
+    return set(keep), noop
 
 
 # --------------------------------------------------------------------------------------
@@ -524,6 +529,7 @@ def evaluate(
     held: dict[str, Held] = {}
     unenforceable: list[Pkg] = []
     plan: set[str] = set()
+    noop: set[str] = set()  # requested, but brew has nothing to do for them
 
     # Packages Homebrew itself cannot resolve (most often: a tap that is untrusted under
     # Homebrew 6 tap trust) can never be dropped by the fixed point, because nothing in the
@@ -566,6 +572,9 @@ def evaluate(
 
         plan, _raw = resolve_plan(action, sorted(candidates), extra_args)
         if not plan:
+            # e.g. `install` of something already installed: nothing to gate, nothing to run.
+            noop |= candidates
+            candidates = set()
             break
 
         if verbose:
@@ -584,7 +593,8 @@ def evaluate(
         if new_candidates == candidates:
             if verbose:
                 print(DIM("  [stall] falling back to per-candidate isolation"), file=sys.stderr)
-            candidates = isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknown)
+            candidates, empty = isolate_clean(action, candidates, extra_args, days, cache, now, allow_unknown)
+            noop |= empty
             plan, _ = resolve_plan(action, sorted(candidates), extra_args) if candidates else (set(), "")
             _v, pkgs, _m = age_check(plan, record=False) if plan else (set(), [], {})
             unenforceable = [p for p in pkgs if p.unenforceable]
@@ -613,8 +623,13 @@ def evaluate(
     # a candidate into the plan too (upgrading ffmpeg also upgrades mpv), so a package can
     # be upgraded without ever having been a candidate. Using `candidates` here listed six
     # packages as held that were in fact being upgraded.
+    # A candidate that survived but is absent from the plan is a no-op as well (requested
+    # alongside packages that do need work). No-ops are their own bucket: putting them in
+    # `pending` labelled them "blocked by: a held dependency" with no dependency to name.
     blocked = set(held)
-    pending = sorted((set(requested) & set(req_meta)) - set(plan) - blocked)
+    planned = {n.split("/")[-1] for n in plan}  # the dry-run may tap-qualify names
+    noop = (noop | {n for n in candidates if n not in planned}) - planned - blocked
+    pending = sorted((set(requested) & set(req_meta)) - planned - blocked - noop)
     implicit: dict[str, list[str]] = {}
     if pending:
         depmap: dict[str, list[str]] = {}
@@ -636,14 +651,14 @@ def evaluate(
         for n in pending:
             implicit[n] = sorted(set(depmap.get(n, [])) & blocked)
 
-    return sorted(candidates), sorted(plan), held, unenforceable, skipped, sorted(leaked), implicit
+    return sorted(candidates), sorted(plan), held, unenforceable, skipped, sorted(leaked), implicit, sorted(noop)
 
 
 # --------------------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------------------
 
-def print_report(days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit):
+def print_report(days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit, noop):
     print()
     print(BOLD(f"Homebrew quarantine — {days}-day cooldown ({action})"))
     print(DIM("  age = last commit to the package's .rb file in its tap"))
@@ -672,6 +687,11 @@ def print_report(days, survivors, plan, held, unenforceable, action, skipped, le
         for n in skipped:
             print(f"  {n}  {DIM('(tap not trusted, or package unavailable)')}")
         print(DIM("  Homebrew 6 tap trust is ignoring these taps; see `brew trust --help`."))
+        print()
+
+    if noop:
+        print(BLUE(f"NOTHING TO DO ({len(noop)})") + DIM("  — already installed or up to date; brew would not act on these"))
+        print("  " + "  ".join(noop))
         print()
 
     if leaked:
@@ -738,7 +758,7 @@ def cmd_gate(args, action: str) -> int:
         return 0
 
     print(DIM(f"==> resolving plan and ages for {len(requested)} package(s)…"), file=sys.stderr)
-    survivors, plan, held, unenforceable, skipped, leaked, implicit = evaluate(
+    survivors, plan, held, unenforceable, skipped, leaked, implicit, noop = evaluate(
         action, requested, args.days, args.brew_args, cache, args.verbose, args.allow_unknown
     )
 
@@ -756,10 +776,11 @@ def cmd_gate(args, action: str) -> int:
             "skipped": skipped,
             "verification_failed": leaked,
             "held_transitively": implicit,
+            "nothing_to_do": noop,
         }, indent=2))
         return 2 if leaked else 0
 
-    print_report(args.days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit)
+    print_report(args.days, survivors, plan, held, unenforceable, action, skipped, leaked, implicit, noop)
 
     if leaked:
         return 2

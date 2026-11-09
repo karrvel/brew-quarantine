@@ -5,7 +5,7 @@ title: brew-quarantine — the tool, its layout and how to work on it
 area: cross
 tags: [repo, layout]
 status: active
-updated: 2026-08-27
+updated: 2026-11-09
 volatility: decays-with-code
 provenance: 2026-08-27 — first public release
 ---
@@ -13,16 +13,17 @@ provenance: 2026-08-27 — first public release
 # The repository
 
 ```
-brew-quarantine        the entire tool — one Python file, no third-party imports
-README.md              user-facing documentation
-_knowledge/            this vault
+brew-quarantine          the entire tool — one Python file, no third-party imports
+test_brew_quarantine.py  stdlib self-tests; never runs brew
+README.md                user-facing documentation
+_knowledge/              this vault
 ```
 
 Deliberately a single file. It has to be installable with a `curl` and a `chmod`, and it has to run under whatever `python3` macOS ships, because a tool that guards installs should not itself need an install step with dependencies.
 
 ## Working on it
 
-There is no build and no test framework yet. The checks that matter are run by hand against a real Homebrew:
+There is no build. `python3 -m unittest -v test_brew_quarantine` runs the stdlib self-tests, which replace every Homebrew and network call with a fake world (and patch `subprocess.run` to fail if anything slips through), so they are safe to run on a machine that matters. They cover the logic, not Homebrew's behaviour. The checks that need a real Homebrew are run by hand:
 
 - **Positive control** — a package whose definition changed in the last few days must be held. `brew-quarantine --dry-run install <recently-bumped-cask>`.
 - **Negative control** — a long-untouched package must clear.

@@ -5,7 +5,7 @@ title: How brew-quarantine decides what may be installed
 area: cross
 tags: [architecture, overview]
 status: active
-updated: 2026-08-27
+updated: 2026-11-09
 volatility: decays-with-code
 provenance: 2026-08-27 — describes `brew-quarantine` at first public release
 ---
@@ -30,7 +30,7 @@ requested ──▶ resolve ──▶ age ──▶ shrink (fixed point) ──�
 
 ## Output contract
 
-Every requested package lands in exactly one of four buckets — **cleared**, **held**, **held transitively**, **skipped** — which are pairwise disjoint and sum to the request. A fifth annotation, *cannot fully enforce*, marks cleared casks whose payload is not pinned ([[cannot-enforce-unpinned-casks]]). The disjointness invariant is load-bearing: it is what caught a real reporting bug ([[transitive-hold-measured-against-plan]]).
+Every requested package lands in exactly one of five buckets — **cleared**, **held**, **held transitively**, **skipped**, **nothing to do** — which are pairwise disjoint and sum to the request. *Nothing to do* is a requested package whose own plan is empty (already installed, already current); before it existed those were mislabelled as held transitively ([[isolate-clean-drops-empty-plans]]). A fifth annotation, *cannot fully enforce*, marks cleared casks whose payload is not pinned ([[cannot-enforce-unpinned-casks]]). The disjointness invariant is load-bearing: it is what caught a real reporting bug ([[transitive-hold-measured-against-plan]]).
 
 ## Trust boundaries
 
