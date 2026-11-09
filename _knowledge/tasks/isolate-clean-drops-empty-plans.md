@@ -25,7 +25,7 @@ Related: [[transitive-hold-measured-against-plan]].
 No-op candidates now have their own bucket, `noop`, reported as **NOTHING TO DO** (`nothing_to_do` in `--json`). Three paths feed it, because the same mislabel had three sources:
 
 - `isolate_clean()` returns `(kept, noop)` — the empty-plan branch records the candidate instead of dropping it silently.
-- The main fixed-point loop: when the remaining candidates resolve to an empty plan (`install` of something already installed), they all move to `noop` and the candidate set is emptied, so `brew` is no longer invoked on a no-op list.
+- The main fixed-point loop: when the remaining candidates resolve to an empty plan (`install` of something already installed), they all move to `noop` and the candidate set is emptied, so `brew` is no longer invoked on a no-op list. This also closed a fail-open path: before, if the dry-run *parsed* to an empty plan (a Homebrew output-format change breaking the parser), final verification passed on the empty plan and every candidate went to `brew` unaged. Now nothing runs, and the visible symptom of a broken parser is **NOTHING TO DO listing every outdated package**. Read that report as a parser failure, not as a clean system.
 - After final verification, any surviving candidate absent from the final plan (a no-op requested alongside real work) is a no-op too.
 
 `pending` (the held-transitively input) now excludes `noop`, and the plan is compared by short name in case the dry-run tap-qualifies a name. `test_brew_quarantine.py` covers all three paths and asserts the five-bucket partition; all three tests fail on the pre-fix script (`6cd0608`) and pass after.

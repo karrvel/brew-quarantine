@@ -73,6 +73,7 @@ brew-quarantine status                   # what is held, and when each clears
 brew-quarantine --days 14 upgrade        # stricter window for one run
 brew-quarantine upgrade --dry-run        # report only; never touches the system
 brew-quarantine --json upgrade           # machine-readable, for scripting
+brew-quarantine --audit                  # after a real run: did brew install anything uncleared?
 ```
 
 | Flag | Effect |
@@ -84,8 +85,9 @@ brew-quarantine --json upgrade           # machine-readable, for scripting
 | `--allow-unknown` | Let packages whose age cannot be determined pass. Default is to hold them. |
 | `--json` | Emit JSON on stdout; progress goes to stderr. |
 | `--brew-arg X` | Pass `X` through to `brew` (repeatable). |
+| `--audit` | Check the last real run against Homebrew's install receipts. Takes no subcommand. See [below](#checking-a-real-run---audit). |
 
-Global flags work on either side of the subcommand, so `brew upgrade --dry-run` behaves the way you would expect.
+Global flags (all but `--audit`) work on either side of the subcommand, so `brew upgrade --dry-run` behaves the way you would expect.
 
 ## What it looks like
 
@@ -121,6 +123,19 @@ Every requested package lands in exactly one bucket. The buckets are disjoint an
 3. **Shrink.** Drop anything inside the cooldown, plus every candidate that depends on it. Repeat to a fixed point. If it stalls, fall back to per-candidate isolation.
 4. **Verify.** Re-resolve the surviving set and assert nothing in the final plan is inside the cooldown. Exit code `2` if that check ever fails.
 5. **Execute.** Hand the survivors to `brew`, with `HOMEBREW_NO_AUTO_UPDATE=1` so the version that was aged is the version that gets installed.
+
+### Checking a real run: `--audit`
+
+Step 4 reads the same `--dry-run` output the gate decided from, so it cannot notice when that output is incomplete — and it has been: a live upgrade installed four held packages while every self-check passed. `--audit` checks against evidence the gate did not produce. Each real run records its start and end time and the set it cleared in `~/.cache/brew-quarantine/last-run.json`. `--audit` then reads `$(brew --cellar)/*/*/INSTALL_RECEIPT.json`, takes every keg whose receipt `time` falls inside that window, and lists any the run did not clear:
+
+```console
+$ brew-quarantine --audit
+Audit of the upgrade run at 2026-01-08 10:47 UTC  (/opt/homebrew/Cellar)
+LEAKED (1)  — installed during the run but never cleared by the gate
+  glib 2.88.3
+```
+
+It exits `0` when everything installed was cleared, `2` on a leak, and `1` when there is nothing to audit (no run recorded yet, or no Cellar). `BREW_QUARANTINE_CELLAR` overrides the Cellar path. Only the most recent run is kept, and only formulae are audited — casks are not. Anything else that installs a keg inside the window, such as `brew` in another terminal, shows up as a leak.
 
 ### Age signal: commit date, not bottle timestamp
 

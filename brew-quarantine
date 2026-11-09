@@ -46,6 +46,8 @@ DEFAULT_DAYS = int(os.environ.get("BREW_QUARANTINE_DAYS", "7"))
 CACHE_PATH = Path(
     os.environ.get("BREW_QUARANTINE_CACHE", Path.home() / ".cache/brew-quarantine/dates.json")
 )
+# What the last real run cleared, and when it ran; read by --audit.
+RUN_RECEIPT = CACHE_PATH.parent / "last-run.json"
 GITHUB_TAP_REPOS = {
     "homebrew/core": "Homebrew/homebrew-core",
     "homebrew/cask": "Homebrew/homebrew-cask",
@@ -791,9 +793,73 @@ def cmd_gate(args, action: str) -> int:
         return 0
 
     print(BOLD(f"==> brew {action} {' '.join(survivors)}"))
-    return subprocess.run(
-        ["brew", action, *args.brew_args, *survivors], env=brew_env()
-    ).returncode
+    started = int(time.time())
+    try:
+        return subprocess.run(
+            ["brew", action, *args.brew_args, *survivors], env=brew_env()
+        ).returncode
+    finally:
+        save_run(action, started, plan)
+
+
+def save_run(action: str, started: int, cleared: list[str]) -> None:
+    try:
+        RUN_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+        RUN_RECEIPT.write_text(json.dumps({
+            "action": action,
+            "started": started,
+            # Install receipts store whole seconds; round the window's end up.
+            "finished": int(time.time()) + 1,
+            "cleared": cleared,
+        }, indent=2))
+    except OSError as e:
+        print(YELLOW(f"Warning: could not write {RUN_RECEIPT} ({e}); --audit cannot check this run."),
+              file=sys.stderr)
+
+
+def installed_between(cellar: Path, start: int, end: int) -> dict[str, str]:
+    """Kegs whose INSTALL_RECEIPT.json `time` (epoch seconds) is in [start, end]: name -> version."""
+    found: dict[str, str] = {}
+    for receipt in cellar.glob("*/*/INSTALL_RECEIPT.json"):
+        try:
+            t = json.loads(receipt.read_text()).get("time")
+        except (OSError, ValueError):
+            continue  # shortcut: an unreadable receipt is skipped, not flagged; flag it if one ever hides a leak
+        if isinstance(t, (int, float)) and start <= t <= end:
+            found[receipt.parent.parent.name] = receipt.parent.name
+    return found
+
+
+def cmd_audit() -> int:
+    """Diff what Homebrew actually installed during the last real run against what was cleared.
+
+    The gate's own final verification reads the same --dry-run it decided from, so it agreed
+    with itself while a live run installed four held packages. Install receipts are written by
+    Homebrew as it installs, which makes them evidence independent of the gate's model.
+    """
+    try:
+        run = json.loads(RUN_RECEIPT.read_text())
+    except (OSError, ValueError):
+        print(YELLOW(f"No run receipt at {RUN_RECEIPT}; it is written by a real (not --dry-run) "
+                     "install or upgrade through the gate."), file=sys.stderr)
+        return 1
+    cellar = os.environ.get("BREW_QUARANTINE_CELLAR") or brew("--cellar").stdout.strip()
+    if not cellar or not Path(cellar).is_dir():
+        print(RED(f"Cellar not found ({cellar or 'brew --cellar failed'})."), file=sys.stderr)
+        return 1
+
+    installed = installed_between(Path(cellar), run["started"], run["finished"])
+    cleared = {n.split("/")[-1] for n in run["cleared"]}
+    leaks = sorted(set(installed) - cleared)
+    when = datetime.fromtimestamp(run["started"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(BOLD(f"Audit of the {run['action']} run at {when}") + DIM(f"  ({cellar})"))
+    if leaks:
+        print(RED(f"LEAKED ({len(leaks)})") + DIM("  — installed during the run but never cleared by the gate"))
+        for n in leaks:
+            print(f"  {n} {installed[n]}")
+        return 2
+    print(GREEN(f"OK — {len(installed)} keg(s) installed during the run, all cleared."))
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -865,8 +931,12 @@ def main() -> int:
                     "This is a supply-chain delay, not macOS Gatekeeper quarantine.",
     )
     add_global_flags(ap, suppress=False)
+    # Main parser only, so `upgrade --audit` is rejected rather than silently ignored.
+    ap.add_argument("--audit", action="store_true",
+                    help="after a real run: list kegs Homebrew installed during it that the gate "
+                         "never cleared (Cellar: env BREW_QUARANTINE_CELLAR, default `brew --cellar`)")
 
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
     for name, help_text in (
         ("upgrade", "upgrade only packages that have cleared the cooldown"),
         ("install", "install only if the package and its deps have cleared the cooldown"),
@@ -879,6 +949,12 @@ def main() -> int:
         add_global_flags(s, suppress=True)
 
     args = ap.parse_args()
+    if args.audit:
+        if args.cmd:
+            ap.error("--audit takes no subcommand")
+        return cmd_audit()
+    if not args.cmd:
+        ap.error("a subcommand is required (upgrade, install, status), or --audit")
     if args.cmd == "status":
         return cmd_status(args)
     return cmd_gate(args, args.cmd)

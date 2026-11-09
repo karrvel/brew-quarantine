@@ -30,7 +30,7 @@ There is no build. `python3 -m unittest -v test_brew_quarantine` runs the stdlib
 - **Closure assertion** — the dependency closure of the cleared set, intersected with `brew outdated`, must be a subset of the cleared set. This is the check that catches leaks.
 - **Bucket accounting** — cleared, held, held-transitively and skipped must be disjoint and sum to the request.
 
-The gap in all of these is that they read the same `--dry-run` the tool reads. [[verify-against-real-run-not-self-report]] tracks the independent check that is still missing.
+All of these read the same `--dry-run` the tool reads. The independent check is `brew-quarantine --audit` after a real run: it must exit `0` ([[verify-against-real-run-not-self-report]]).
 
 ## Conventions
 

@@ -26,7 +26,8 @@ requested ──▶ resolve ──▶ age ──▶ shrink (fixed point) ──�
 2. **Age** — each package's `.rb` file path comes from `ruby_source_path`; its last commit date comes from the GitHub API for official taps and from `git log` for local ones ([[age-signal-formula-commit-date]]).
 3. **Shrink** — drop violators plus every candidate whose dependency closure contains one, re-resolve, repeat. Per-candidate isolation is the fallback if it stalls.
 4. **Verify** — re-resolve the survivors and assert the final plan contains nothing inside the cooldown. Exit `2` if it does.
-5. **Execute** — hand the survivors to `brew` with `HOMEBREW_NO_AUTO_UPDATE=1`, so the version that was aged is the version installed.
+5. **Execute** — hand the survivors to `brew` with `HOMEBREW_NO_AUTO_UPDATE=1`, so the version that was aged is the version installed, and record the run (window plus cleared set) in `last-run.json` beside the date cache.
+6. **Audit** (after the fact, `--audit`) — diff the kegs whose `INSTALL_RECEIPT.json` time falls in the run window against the cleared set. It is the only check whose evidence the gate did not produce ([[verify-against-real-run-not-self-report]]).
 
 ## Output contract
 

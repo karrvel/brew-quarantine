@@ -10,12 +10,13 @@ updated: 2026-11-09
 
 Remaining work. LIVE = still open.
 
-## 🔴 Open work (status: active) (1)
+## 🔴 Open work (status: active) (0)
 
-- [[verify-against-real-run-not-self-report]] — Add a post-run receipt audit that compares what was installed against what was cleared
+_none_
 
-## Done / historical (1)
+## Done / historical (2)
 
 - [[isolate-clean-drops-empty-plans]] — isolate_clean() silently drops candidates that resolve to an empty plan, mislabelling them as blocked
+- [[verify-against-real-run-not-self-report]] — Add a post-run receipt audit that compares what was installed against what was cleared
 
 *2 shards. Generated — edit shards, then `python3 kb-sync.py`.*

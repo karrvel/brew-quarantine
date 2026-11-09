@@ -7,9 +7,17 @@ Every call that would reach Homebrew or the network is replaced by a fake world,
 subprocess.run is patched to fail loudly if anything slips past the fakes.
 """
 
+import argparse
+import atexit
+import contextlib
+import io
+import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
@@ -18,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 TMP = Path(tempfile.mkdtemp(prefix="bq-test-"))
+atexit.register(shutil.rmtree, TMP, True)
 # Must be set before loading the script: CACHE_PATH is read at import time.
 os.environ["BREW_QUARANTINE_CACHE"] = str(TMP / "cache" / "dates.json")
 
@@ -94,6 +103,77 @@ class EvaluateBuckets(unittest.TestCase):
         survivors, plan, *_rest, implicit, noop = res
         self.assertEqual((survivors, plan, implicit, noop), ([], [], {}, ["r"]))
         self.assert_partition(["r"], res)
+
+
+def keg(cellar, name, version, installed_at):
+    d = Path(cellar, name, version)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "INSTALL_RECEIPT.json").write_text(json.dumps({"time": installed_at, "arch": "arm64"}))
+
+
+class Audit(unittest.TestCase):
+    """--audit diffs Cellar install receipts against the last real run's cleared set."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(dir=TMP))
+        self.cellar = self.dir / "Cellar"
+        self.cellar.mkdir()
+        self.receipt = self.dir / "last-run.json"  # what RUN_RECEIPT resolves to below
+
+    def audit(self):
+        env = dict(os.environ,
+                   BREW_QUARANTINE_CACHE=str(self.dir / "dates.json"),
+                   BREW_QUARANTINE_CELLAR=str(self.cellar),
+                   PATH="/usr/bin:/bin")  # no brew on PATH: a stray call fails instead of running
+        p = subprocess.run([sys.executable, str(SCRIPT), "--audit"], env=env,
+                           capture_output=True, text=True, timeout=60)
+        listed = [ln.split()[0] for ln in p.stdout.splitlines() if ln.startswith("  ")]
+        return p.returncode, listed, p.stdout + p.stderr
+
+    def test_real_run_writes_receipt_and_audit_flags_the_leak(self):
+        now = int(time.time())
+        keg(self.cellar, "old", "0.1", now - 30 * 86400)  # before the window: ignored
+        keg(self.cellar, "a", "1.0", now - 30 * 86400)    # a's previous keg
+
+        def fake_brew(cmd, **kw):
+            assert cmd == ["brew", "upgrade", "a"], cmd
+            t = int(time.time())
+            keg(self.cellar, "a", "2.0", t)        # cleared, requested
+            keg(self.cellar, "dep", "1.1", t)      # cleared, pulled in as a dependency
+            keg(self.cellar, "sneaky", "3.0", t)   # installed but never cleared: the leak
+            return subprocess.CompletedProcess(cmd, 0)
+
+        args = argparse.Namespace(bypass=False, no_update=True, packages=["a"], days=7,
+                                  brew_args=[], verbose=False, allow_unknown=False,
+                                  json=False, dry_run=False)
+        verdict = (["a"], ["a", "dep"], {}, [], [], [], {}, [])
+        with mock.patch.object(bq, "RUN_RECEIPT", self.receipt), \
+             mock.patch.object(bq, "evaluate", return_value=verdict), \
+             mock.patch.object(bq.subprocess, "run", side_effect=fake_brew), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bq.cmd_gate(args, "upgrade"), 0)
+
+        run = json.loads(self.receipt.read_text())
+        self.assertEqual(run["cleared"], ["a", "dep"])
+        self.assertLessEqual(run["started"], run["finished"])
+
+        rc, listed, out = self.audit()
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(listed, ["sneaky"], out)
+
+    def test_audit_passes_when_everything_installed_was_cleared(self):
+        now = int(time.time())
+        keg(self.cellar, "old", "0.1", now - 30 * 86400)
+        keg(self.cellar, "a", "2.0", now - 5)
+        keg(self.cellar, "tapdep", "1.0", now - 5)
+        self.receipt.write_text(json.dumps({"action": "upgrade", "started": now - 10,
+                                            "finished": now, "cleared": ["a", "user/tap/tapdep"]}))
+        rc, listed, out = self.audit()
+        self.assertEqual((rc, listed), (0, []), out)
+
+    def test_audit_without_a_run_receipt_fails(self):
+        rc, _listed, out = self.audit()
+        self.assertEqual(rc, 1, out)
 
 
 if __name__ == "__main__":
